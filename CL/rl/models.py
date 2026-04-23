@@ -9,9 +9,14 @@ from tensorflow.keras.layers import Conv2D, Flatten, Dense, Activation, Concaten
 
 def mlp(state_shape: Tuple[int], num_tasks: int, hidden_sizes: Iterable[int], activation: Callable,
         use_layer_norm: bool = False, use_lstm: bool = False, hide_task_id: bool = False) -> Model:
-    task_input = Input(shape=num_tasks, name='task_input', dtype=tf.float32)
+    # Keras expects `shape` to be a tuple. For a 1D vector of length `num_tasks`,
+    # the correct shape is `(num_tasks,)` (not `num_tasks`).
+    task_input = Input(shape=(num_tasks,), name='task_input', dtype=tf.float32)
     conv_in = Input(shape=state_shape, name='conv_head_in')
-    conv_head = build_conv_head(conv_in, use_lstm)
+    # If observations are stacked as (T, H, W, C), `state_shape` will be 4D.
+    # In that case we must apply the conv stack per-frame (TimeDistributed).
+    obs_is_stacked = len(state_shape) == 4
+    conv_head = build_conv_head(conv_in, use_lstm=use_lstm, obs_is_stacked=obs_is_stacked)
 
     model = conv_head if hide_task_id else Concatenate()([conv_head, task_input])
     model = Dense(hidden_sizes[0])(model)
@@ -27,16 +32,29 @@ def mlp(state_shape: Tuple[int], num_tasks: int, hidden_sizes: Iterable[int], ac
     return model
 
 
-def build_conv_head(conv_head, use_lstm):
+def build_conv_head(conv_head, use_lstm: bool, obs_is_stacked: bool):
+    # Observations may be stacked as (T, H, W, C) even without an LSTM.
+    # In that case, apply the conv head per-frame with TimeDistributed and then
+    # flatten across time for an MLP.
+
     for filters, kernel, stride in zip((32, 64, 64), (8, 4, 3), (4, 2, 1)):
         conv_layer = Conv2D(filters, kernel, stride, activation="relu")
-        conv_head = TimeDistributed(conv_layer)(conv_head) if use_lstm else conv_layer(conv_head)
+        if use_lstm or obs_is_stacked:
+            conv_head = TimeDistributed(conv_layer)(conv_head)
+        else:
+            conv_head = conv_layer(conv_head)
+
     if use_lstm:
         conv_head = TimeDistributed(Flatten())(conv_head)
         conv_head = LSTM(512, activation='tanh')(conv_head)
-    else:
-        conv_head = Flatten()(conv_head)
-    return conv_head
+        return conv_head
+
+    if obs_is_stacked:
+        conv_head = TimeDistributed(Flatten())(conv_head)
+        conv_head = Flatten()(conv_head)  # collapse time dimension
+        return conv_head
+
+    return Flatten()(conv_head)
 
 
 def _choose_head(out: tf.Tensor, num_heads: int, one_hot_task_id: tf.Tensor) -> tf.Tensor:

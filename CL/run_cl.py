@@ -8,6 +8,7 @@ import tensorflow as tf
 from CL.methods.agem import AGEM_SAC
 from CL.methods.clonex import ClonExSAC
 from CL.methods.ewc import EWC_SAC
+from CL.methods.hace import HACE_SAC
 from CL.methods.l2 import L2_SAC
 from CL.methods.mas import MAS_SAC
 from CL.methods.owl import OWL_SAC
@@ -36,6 +37,7 @@ class CLMethod(Enum):
     OWL = (OWL_SAC, ['cl_reg_coef', 'regularize_critic'])
     CLONEX = (ClonExSAC, ['episodic_mem_per_task', 'episodic_batch_size', 'regularize_critic', 'cl_reg_coef',
                           'episodic_memory_from_buffer'])
+    HACE = (HACE_SAC, ['hace_health_setpoint', 'hace_internal_reward_scale'])
 
 
 def main(parser: argparse.ArgumentParser):

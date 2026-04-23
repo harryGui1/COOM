@@ -6,7 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.optimizers.legacy import Adam
+from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import ExponentialDecay, PolynomialDecay, LearningRateSchedule
 from tensorflow.python.framework import dtypes
 from tensorflow_probability.python.distributions import Categorical
@@ -228,7 +228,12 @@ class SAC:
                 power=1.0,
             )
 
-        self.optimizer = Adam(learning_rate=lr)
+        # Keras 3 optimizers keep an internal set of "known variables". Re-using
+        # one optimizer instance across different networks (actor vs critics)
+        # will error with "Unknown variable". Use separate optimizers.
+        self.actor_optimizer = Adam(learning_rate=lr)
+        self.critic_optimizer = Adam(learning_rate=lr)
+        self.alpha_optimizer = Adam(learning_rate=lr) if alpha == "auto" else None
 
         # For reference on automatic alpha tuning, see
         # "Automating Entropy Adjustment for Maximum Entropy" section
@@ -246,6 +251,19 @@ class SAC:
                 self.target_entropy = (
                         np.prod(env.action_space.n).astype(np.float32) * target_1d_entropy
                 )
+
+    def on_env_reset(self, info: Dict) -> None:
+        """Hook called after every `env.reset()` in `run()`."""
+        pass
+
+    def shape_reward(self, reward: float, info: Dict) -> Tuple[float, float]:
+        """Optionally shape reward.
+
+        Returns:
+            total_reward: reward used for learning + replay.
+            internal_reward: shaped component (for logging).
+        """
+        return reward, 0.0
 
     def adjust_gradients(
             self,
@@ -427,12 +445,12 @@ class SAC:
             critic_gradients: List[tf.Tensor],
             alpha_gradient: List[tf.Tensor],
     ) -> None:
-        self.optimizer.apply_gradients(zip(actor_gradients, self.actor.trainable_variables))
+        self.actor_optimizer.apply_gradients(zip(actor_gradients, self.actor.trainable_variables))
 
-        self.optimizer.apply_gradients(zip(critic_gradients, self.critic_variables))
+        self.critic_optimizer.apply_gradients(zip(critic_gradients, self.critic_variables))
 
         if self.auto_alpha:
-            self.optimizer.apply_gradients([(alpha_gradient, self.all_log_alpha)])
+            self.alpha_optimizer.apply_gradients([(alpha_gradient, self.all_log_alpha)])
 
         # Polyak averaging for target variables
         for v, target_v in zip(
@@ -604,7 +622,10 @@ class SAC:
 
         if self.reset_optimizer_on_task_change:
             self.logger.log(f"Resetting the optimizer", color='cyan')
-            reset_optimizer(self.optimizer)
+            reset_optimizer(self.actor_optimizer)
+            reset_optimizer(self.critic_optimizer)
+            if self.auto_alpha and self.alpha_optimizer is not None:
+                reset_optimizer(self.alpha_optimizer)
 
         # Update variables list and update function in case model changed.
         # E.g: For VCL after the first task we set trainable=False for layer
@@ -630,7 +651,9 @@ class SAC:
             return
 
         obs, info = self.env.reset()
+        self.on_env_reset(info)
         episodes, episode_return, episode_len = 0, 0, 0
+        episode_return_extrinsic, episode_return_internal = 0.0, 0.0
         # Set exploration head as "undecided".
         exploration_head_one_hot = None
 
@@ -675,9 +698,12 @@ class SAC:
             # Environment step
             action = action.numpy()[0] if isinstance(action, tf.Tensor) else action
             next_obs, reward, done, _, info = self.env.step(action)
+            total_reward, internal_reward = self.shape_reward(float(reward), info)
             if self.exploration_helper is not None and exploration_head_one_hot is not None:
-                self.exploration_helper.update_reward(reward)
-            episode_return += reward
+                self.exploration_helper.update_reward(total_reward)
+            episode_return += total_reward
+            episode_return_extrinsic += float(reward)
+            episode_return_internal += float(internal_reward)
             episode_len += 1
             action_counts[action] += 1
 
@@ -685,7 +711,7 @@ class SAC:
             done_to_store = False if episode_len == self.max_episode_len else done
 
             # Store experience to replay buffer
-            self.replay_buffer.store(obs, action, reward, next_obs, done_to_store, one_hot_vec)
+            self.replay_buffer.store(obs, action, total_reward, next_obs, done_to_store, one_hot_vec)
 
             # Update the most recent observation
             obs = next_obs
@@ -696,13 +722,21 @@ class SAC:
                 buffer_capacity = self.replay_buffer.size / self.replay_buffer.max_size * 100  # Percentage
                 self.logger.log(f"Episode {episodes} duration: {(time.time() - episode_start):.4f}. Buffer capacity: "
                                 f"{buffer_capacity:.2f}% ({self.replay_buffer.size}/{self.replay_buffer.max_size})")
-                self.logger.store({"train/return": episode_return, "train/ep_length": episode_len,
-                                   "train/episodes": episodes, "buffer_capacity": buffer_capacity})
+                self.logger.store({
+                    "train/return": episode_return,
+                    "train/return_extrinsic": episode_return_extrinsic,
+                    "train/return_internal": episode_return_internal,
+                    "train/ep_length": episode_len,
+                    "train/episodes": episodes,
+                    "buffer_capacity": buffer_capacity,
+                })
                 self.logger.store(self.env.get_statistics('train'))
                 self.env.clear_episode_statistics()
                 episode_return, episode_len = 0, 0
+                episode_return_extrinsic, episode_return_internal = 0.0, 0.0
                 if global_timestep < self.steps - 1:
                     obs, info = self.env.reset()
+                    self.on_env_reset(info)
                     exploration_head_one_hot = None
 
             # Update handling
@@ -747,9 +781,19 @@ class SAC:
                     self.logger.log(f"Time elapsed for the testing procedure: {time.time() - test_start_time}")
 
                 # Determine the current learning rate of the optimizer
-                lr = self.optimizer.lr
-                if issubclass(type(lr), LearningRateSchedule):
-                    lr = self.optimizer._decayed_lr('float32').numpy()
+                # (All optimizers share the same schedule/value.)
+                lr = getattr(self.actor_optimizer, "learning_rate", None)
+                if lr is None:
+                    lr = getattr(self.actor_optimizer, "lr", None)
+
+                if lr is not None and isinstance(lr, LearningRateSchedule):
+                    # Works across TF versions.
+                    lr = float(lr(self.actor_optimizer.iterations).numpy())
+                elif lr is not None:
+                    # Could be a tf.Variable / tensor / python float
+                    lr = float(tf.convert_to_tensor(lr).numpy())
+                else:
+                    lr = float("nan")
 
                 log_start_time = time.time()
                 # Log the action counts and reset them

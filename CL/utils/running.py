@@ -25,7 +25,16 @@ def reset_optimizer(optimizer) -> None:
     if hasattr(optimizer, "iterations"):
         optimizer.iterations.assign(0)
     # The first variable is the step count
-    for var in optimizer.variables()[1:]:
+    opt_vars = getattr(optimizer, "variables", None)
+    # Keras/TF optimizer API differs across versions:
+    # - TF/Keras 2 often exposes `optimizer.variables()` (callable)
+    # - Keras 3 exposes `optimizer.variables` (list/tuple property)
+    if callable(opt_vars):
+        vars_list = opt_vars()
+    else:
+        vars_list = opt_vars if opt_vars is not None else []
+
+    for var in list(vars_list)[1:]:
         var.assign(tf.zeros_like(var))
 
 

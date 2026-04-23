@@ -25,7 +25,7 @@ def get_arg_parser():
     # Continual learning
     arg("--sequence", type=str, default=None, choices=['CD4', 'CD8', 'CD16', 'CO4', 'CO8', 'CO16', 'COC', 'MIXED'],
         help="Name of the continual learning sequence")
-    arg("--cl_method", type=str, choices=[None, "clonex", "owl", "l2", "ewc", "mas", "vcl", "packnet", "agem"],
+    arg("--cl_method", type=str, choices=[None, "clonex", "owl", "l2", "ewc", "mas", "vcl", "packnet", "agem", "hace"],
         default=None, help="If None, the fine-tuning method will be used")
     arg('--start_from', type=int, default=0, help='Which task to start/continue the training from')
     arg('--num_repeats', type=int, default=1, help='How many times to repeat the sequence')
@@ -132,6 +132,12 @@ def get_arg_parser():
         help="Number of examples to keep in additional memory per task. Valid for 'agem' continual learning method.")
     arg("--episodic_batch_size", type=int, default=128,
         help="Minibatch size to compute additional loss in 'agem' continual learning method.")
+
+    # HACE (homeostatic) reward shaping
+    arg("--hace_health_setpoint", type=float, default=100.0,
+        help="Target health setpoint for HACE internal reward shaping.")
+    arg("--hace_internal_reward_scale", type=float, default=0.01,
+        help="Scale for HACE internal reward (drive reduction) component.")
 
     # Observation
     arg('--frame_stack', type=int, default=4, help='Number of frames to stack')
